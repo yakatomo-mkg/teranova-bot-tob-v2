@@ -13,7 +13,8 @@ function showMessageDialog(title, message) {
 
 
 function getLastDataRow(sheet, colNumber) {
-  const lastDataRow = sheet.getRange(sheet.getMaxRows(), colNumber).getNextDataCell(SpreadsheetApp.Direction.UP).getRow();
+  const lastDataRow = sheet.getRange(sheet.getMaxRows(), colNumber)
+    .getNextDataCell(SpreadsheetApp.Direction.UP).getRow();
   return lastDataRow;
 }
 
@@ -28,11 +29,8 @@ function rowColoredAndUnchecked(sheet, rows, color, col=sheet.getLastColumn()) {
 
 
 
-
 function deleteColoredRows() {
-
   const activeSheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
-  console.log(activeSheet.getName());
   const sheetName = activeSheet.getName();
 
   if (sheetName === '注文データ' || sheetName === '納品書作成') {
@@ -55,10 +53,9 @@ function deleteColoredRows() {
 
 
 function logErrorToSheet(functionName, error) {
-  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('ErrorLog');
-  const lastRow = sheet.getLastRow();
-  sheet.getRange(lastRow + 1, 1).setValue(new Date());
-  sheet.getRange(lastRow + 1, 2).setValue(`Error in ${functionName}`);
-  sheet.getRange(lastRow + 1, 3).setValue(error.message);
+  const lastRow = logSheet.getLastRow();
+  logSheet.getRange(lastRow + 1, 1).setValue(new Date());
+  logSheet.getRange(lastRow + 1, 2).setValue(`Error in ${functionName}`);
+  logSheet.getRange(lastRow + 1, 3).setValue(error.message);
 }
 

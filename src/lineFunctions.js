@@ -1,143 +1,90 @@
-/** 
- * （友達追加時） LINEユーザーIDをもとに、プロフィール情報を取得してくる関数
- */
-function getUserProfile(userId) {
-  try {
-    // ユーザ情報を取得するための、Messaging APIエンドポイント
-    const LINE_GET_PROFILE_URL = `https://api.line.me/v2/bot/profile/${userId}`;
-    const res = UrlFetchApp.fetch(LINE_GET_PROFILE_URL, {
-      headers: {
-        Authorization: `Bearer ${LINE_CHANNEL_TOKEN}`,
-      },
-    })
-    return JSON.parse(res.getContent()).displayName;  // アカウント名を返す
-  } catch (error) {
-    throw new Error(`Error in getUserProfile: ${error.message}`);
-  }
+/** ===========================
+ * LINE Messaging 送受信サービス
+ * =========================== */
 
+/** Messaging APIに渡す messages配列を “最低限送れる形” に整える */
+function normalizeLineMessages(messages) {
+  if (!Array.isArray(messages)) return [];
+  return messages.map(m => {
+    if (!m || typeof m !== 'object') return { type: 'text', text: String(m) };
+    if (!m.type) return { type: 'text', text: JSON.stringify(m) };
+    return m;
+  });
 }
 
+/** 共通：LINE API 呼び出し（指数バックオフ・リトライ対応） */
+function invokeLineApi(url, payload) {
+  const { maxAttempts, baseDelayMs, retryStatuses } = AppConfig.line.backoff;
+  let attempt = 0;
 
-/**
- * 「注文ID」の質問に対してorderIdの値をセットし、事前入力フォームURLを返す関数
- * @params  {string} id - orderId
- * @returns {string} url - 事前入力フォームURL 
- */
-function generatePrefilledFormUrl(id) {
-  try {
-    const item = form.getItems()[0];  // 最初の質問を取得
-    const itemType = item.getType();  // アイテムのタイプを取得
-    console.log(`First item type: ${itemType}`);  // 最初の質問のタイプをデバッグ出力
-    console.log(`First item title: ${item.getTitle()}`);  // 最初の質問のタイトルをデバッグ出力
-    if (!item && item.getTitle() !== "注文ID") {
-      throw new Error("質問タイトル「注文ID」が存在しません。");
+  while (attempt < maxAttempts) {
+    const res = UrlFetchApp.fetch(url, {
+      method: 'post',
+      contentType: 'application/json',
+      headers: { Authorization: `Bearer ${LINE_CHANNEL_TOKEN}` },
+      payload: JSON.stringify(payload),
+      muteHttpExceptions: true
+    });
+    const code = res.getResponseCode();
+    const body = res.getContentText();
+
+    if (retryStatuses.indexOf(code) === -1) {
+      if (code >= 400) throw new Error(`LINE API error ${code}: ${body}`);
+      return res;
     }
-    // フォームへの新しい回答を作成
-    const formRes = form.createResponse();
-    // 上記で取得した item をテキスト質問として扱い、orderIdを用いて回答を作成
-    const itemRes = item.asTextItem().createResponse(id);
-    // 作成した回答(itemRes)をフォーム回答に追加
-    formRes.withItemResponse(itemRes);
-    return formRes.toPrefilledUrl();  // 事前入力フォームURL 
-  } catch (error) {
-    throw new Error(`Error in generatePrefilledFormUrl: ${error.message}`);
-  }  
+    attempt += 1;
+    if (attempt >= maxAttempts) throw new Error(`LINE API retry exhausted with ${code}: ${body}`);
+    Utilities.sleep(baseDelayMs * Math.pow(2, attempt - 1));
+  }
 }
 
 
+/** サービス層（reply/push/multicast/管理者通知） */
+const LineMessagingService = (() => {
+  function reply(replyToken, messages) {
+    if (!replyToken) throw new Error('replyToken is required');
+    const payload = { replyToken, messages: normalizeLineMessages(messages) };
+    invokeLineApi(AppConfig.line.endpoints.REPLY, payload);
+  }
+  function push(lineUserId, messages) {
+    if (!lineUserId) throw new Error('lineUserId is required');
+    const payload = { to: lineUserId, messages: normalizeLineMessages(messages) };
+    invokeLineApi(AppConfig.line.endpoints.PUSH, payload);
+  }
+  function multicast(userIds, messages) {
+    if (!Array.isArray(userIds) || userIds.length === 0) return;
+    const payload = { to: userIds, messages: normalizeLineMessages(messages) };
+    invokeLineApi(AppConfig.line.endpoints.MULTICAST, payload);
+  }
 
-/** 
- * スクリプトキャッシュ(データの一時的な保存サービス)を操作するためのヘルパー関数
- */
-function makeCache() {
-  const cache = CacheService.getScriptCache();  // スクリプトキャッシュのインスタンスを作成
-  return {
-    // getプロパティ : 指定されたキーに対応する値を取得する
-    get: function(key) {
-      return JSON.parse(cache.get(key));  // JSオブジェクトにパースして返す
-    },
-
-    // putプロパティ : 指定されたキーとvalueをキャッシュに保存する
-    put: function(key, value, sec) {
-      cache.put(key, JSON.stringify(value), (sec === undefined) ? 600 : sec);  // JSON文字列に変換して保存
-      return value;
-    },
-
-    // removeプロパティ : 指定されたキーに対応するvalueをキャッシュから削除する   
-    remove: function(key) {
-      cache.remove(key);
-      return true;  // キャッシュデータ削除成功時のの確認用返り値
+  function notifyAdministrators(message) {
+    const ids = getAdminUserIds();
+    if (ids.length === 0) {
+      console.warn('notifyAdministrators: no admin IDs');
+      return;
     }
-  };
-}
-
-
-/** 
- * LINEユーザーに応答メッセージを送信する関数
- */
-function sendReplyMessage(replyToken, messages) {
-  try {
-    const LINE_REPLY_URL = "https://api.line.me/v2/bot/message/reply";
-    const options = {
-      method: "post",
-      headers: {
-        "Content-Type": "application/json; charset=UTF-8",
-        Authorization: `Bearer ${LINE_CHANNEL_TOKEN}`,
-      },
-      payload: JSON.stringify({ replyToken, messages }),
-    };
-    return UrlFetchApp.fetch(LINE_REPLY_URL, options);
-
-  } catch (error) {
-    throw new Error(`Error in sendReplyMessage: ${error.message}`);
+    try {
+      multicast(ids, [{ type: 'text', text: message }]);
+    } catch (e) {
+      console.error(`multicast failed: ${e && e.message}`);
+      ids.forEach(id => {
+        try { push(id, [{ type: 'text', text: message }]); }
+        catch (err) { console.error(`push failed for ${id}: ${err && err.message}`); }
+      });
+    }
   }
-};
+  return { reply, push, multicast, notifyAdministrators };
+})();
 
 
 
-/** 
- * 引数で指定したLINEユーザーに、pushメッセージを送信する関数
- * (任意のタイミングでメッセージを送信できる)
- */
-const sendPushMessage = (lineUserId, message) => {
-  try {
-    const LINE_PUSH_URL = "https://api.line.me/v2/bot/message/push";
-    const postData = {
-      to: lineUserId,
-      messages: [
-        {
-          type: "text",
-          text: message,
-        },
-      ],
-    };
-    const headers = {
-      "Content-Type": "application/json; charset=UTF-8",
-      Authorization: `Bearer ${LINE_CHANNEL_TOKEN}`,
-    };
-    const options = {
-      method: "post",
-      headers: headers,
-      payload: JSON.stringify(postData),
-    };
-    const res = UrlFetchApp.fetch(LINE_PUSH_URL, options);
-    return res;
-  } catch (error) {
-    throw new Error(`Error in sendPushMessage: ${error.message}`);
-  }
-  
-}
-
-
-/**
- * AdminsシートのB列（2列目）に登録されたLINE userIdを取得
- */
+/** 管理者 UID 一覧（管理者シート B列） */
 function getAdminUserIds() {
   const lastRow = adminSheet.getLastRow();
   if (lastRow < 2) return [];
-
+  const uidCol = AppConfig.adminSheet.uidCol;
   return adminSheet
-    .getRange(2, 2, lastRow - 1, 1)
+    .getRange(2, uidCol, lastRow - 1, 1)
     .getValues()
     .flat()
     .map(v => String(v || '').trim())
@@ -145,99 +92,111 @@ function getAdminUserIds() {
 }
 
 
-/**
- * 管理者へ一斉通知（最大10名想定）
- *  - まず /multicast でまとめて送信
- *  - エラー時は個別 /push でフォールバック
- */
+/** 管理者への一斉通知（他ファイル互換ラッパー） */
 function notifyToAdmin(message) {
-  const adminIds = getAdminUserIds();
-  if (adminIds.length === 0) {
-    console.warn('No admin userIds found in Admins sheet (column B).');
-    return;
-  }
-
-  try {
-    lineMulticast(adminIds, message);
-  } catch (e) {
-    console.error(`multicast failed, fallback to individual push. Reason: ${e}`);
-    adminIds.forEach(uid => {
-      try { linePushMessage(uid, message); }
-      catch (err) { console.error(`push failed for ${uid}: ${err}`); }
-    });
-  }
+  LineMessagingService.notifyAdministrators(message);
 }
 
-/** 個別Push */
-function linePushMessage(userId, text) {
-  const payload = { to: userId, messages: [{ type: 'text', text }] };
-  const res = UrlFetchApp.fetch(LINE_PUSH_ENDPOINT, {
-    method: 'post',
-    contentType: 'application/json',
-    headers: { Authorization: `Bearer ${LINE_CHANNEL_TOKEN}` },
-    payload: JSON.stringify(payload),
-    muteHttpExceptions: true,
-  });
-  const code = res.getResponseCode();
-  if (code >= 400) {
-    throw new Error(`LINE push failed: ${code} ${res.getContentText()}`);
-  }
-}
-
-/** 一斉送信（/multicast） */
-function lineMulticast(userIds, text) {
-  const url = 'https://api.line.me/v2/bot/message/multicast';
-  const payload = { to: userIds, messages: [{ type: 'text', text }] };
-  const res = UrlFetchApp.fetch(url, {
-    method: 'post',
-    contentType: 'application/json',
-    headers: { Authorization: `Bearer ${LINE_CHANNEL_TOKEN}` },
-    payload: JSON.stringify(payload),
-    muteHttpExceptions: true,
-  });
-  const code = res.getResponseCode();
-  if (code >= 400) {
-    throw new Error(`LINE multicast failed: ${code} ${res.getContentText()}`);
-  }
-}
-
-
-
-
-/**
- * 管理者登録の合言葉を取得（「管理者アカウント」シートのE2）
- */
+/** 管理者登録キーワード（管理者シート!E2） */
 function getAdminRegisterKeyword() {
-  const keyword = String(adminSheet.getRange('E2').getValue() || '').trim();
-  if (!keyword) {
-    throw new Error("管理者登録キーワードが未設定です（管理者アカウント!E2）");
-  }
+  const cell = AppConfig.adminSheet.keywordCell;
+  const keyword = String(adminSheet.getRange(cell).getValue() || '').trim();
+  if (!keyword) throw new Error(`管理者登録キーワードが未設定です（${AppConfig.sheetNames.ADMIN}!${cell}）`);
   return keyword;
 }
 
-
-/**
- * UID を「管理者アカウント」シートに記録
- */
+/** UID を管理者シートに upsert（A:時刻, B:UID） */
 function registerAdminAccount(userId) {
+  const startRow = 2;
   const lastRow = adminSheet.getLastRow();
-  const startRow = 2; // 1行目はヘッダー
-
   if (lastRow >= startRow) {
-    const ids = adminSheet
-      .getRange(startRow, 2, lastRow - startRow + 1, 1)
-      .getValues()
-      .flat()
-      .map(v => String(v || '').trim());
-
+    const ids = adminSheet.getRange(startRow, 2, lastRow - startRow + 1, 1)
+      .getValues().flat().map(v => String(v || '').trim());
     const idx = ids.findIndex(v => v === userId);
     if (idx !== -1) {
-      // 既存の場合は A列の時刻を更新
       adminSheet.getRange(startRow + idx, 1).setValue(new Date());
       return;
     }
   }
-  // 未登録なら末尾に追記
   adminSheet.getRange(lastRow + 1, 1, 1, 2).setValues([[new Date(), userId]]);
+}
+
+
+/** LINEプロフィール（ID & displayName）取得 */
+function getUserProfile(userId) {
+  try {
+    const url = AppConfig.line.endpoints.profile(userId);
+    const res = UrlFetchApp.fetch(url, {
+      method: 'get',
+      headers: { Authorization: `Bearer ${LINE_CHANNEL_TOKEN}` },
+      muteHttpExceptions: true
+    });
+    const code = res.getResponseCode();
+    if (code >= 400) throw new Error(`LINE profile error ${code}: ${res.getContentText()}`);
+    const json = JSON.parse(res.getContentText() || '{}');
+    return json.displayName || '';
+  } catch (error) {
+    throw new Error(`Error in getUserProfile: ${error.message}`);
+  }
+}
+
+/** 事前入力フォームURLを生成（フォーム末尾の設問「注文ID」に orderId をセット） */
+function generatePrefilledFormUrl(orderId) {
+  try {
+    // タイトル一致のテキスト設問を検索
+    const matches = form.getItems(FormApp.ItemType.TEXT)
+      .filter(item => item.getTitle() === AppConfig.form.titles.ORDER_ID);
+
+    if (matches.length === 0) {
+      throw new Error(`質問タイトル「${AppConfig.form.titles.ORDER_ID}」がフォーム内に見つかりません。`);
+    }
+    if (matches.length > 1) {
+      throw new Error(`質問タイトル「${AppConfig.form.titles.ORDER_ID}」が複数存在します。1つのみになるようフォームを調整してください。`);
+    }
+
+    const item = matches[0];
+    const formRes = form.createResponse();
+    const itemRes = item.asTextItem().createResponse(orderId);
+    formRes.withItemResponse(itemRes);
+    const baseUrl = formRes.toPrefilledUrl();
+
+    // 事前入力（entry.xxx=...）が入っていないURLは「注文ID未セット」と判定して即エラー
+    // ex.「https://docs.../viewform だけ」 or 「entry.xxx が無い」
+    if (baseUrl.indexOf('?') === -1 || !/[?&]entry\.\d+=/.test(baseUrl)) {
+      throw new Error('Prefilled URL に 注文ID が含まれていません');
+    }
+
+    // セクション到達を保証（2ページ想定: 0,1）
+    // 参照記事: https://qiita.com/Lucy_kgsmec/items/5d84e2dec15a80e14594
+    const sep = baseUrl.indexOf('?') === -1 ? '?' : '&';
+    const url = `${baseUrl}${sep}pageHistory=0,1`;
+
+    // 注文IDが埋め込まれているか最終チェック（念のため）
+    if (url.indexOf(encodeURIComponent(orderId)) === -1) {
+      throw new Error('Prefilled URL に注文IDの値が含まれていません');
+    }
+
+    return url;
+  } catch (error) {
+    throw new Error(`Error in generatePrefilledFormUrl: ${error.message}`);
+  }
+}
+
+
+
+/** 既存互換の簡易キャッシュ（handleFormSubmit で参照） */
+function makeCache() {
+  const cache = CacheService.getScriptCache();
+  return {
+    get: key => {
+      const v = cache.get(key);
+      return v ? JSON.parse(v) : null;
+    },
+    put: (key, value, sec) => {
+      cache.put(key, JSON.stringify(value), sec || 600);
+      return value;
+    },
+    remove: key => (cache.remove(key), true)
+  };
 }
 

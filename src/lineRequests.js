@@ -1,160 +1,143 @@
-/** 定数定義 */
-// LINEのイベントタイプ
-const EVENT_TYPES = {
-  MESSAGE: "message", //　メッセージイベント
-  FOLLOW: "follow"    // 友達追加イベント
-};
+/** ===========================
+ * LINE Webhook エントリポイント
+ * =========================== */
 
-// LINE応答メッセージ発動ワード
-const MESSAGES = {
-  ORDER: "注文",
-  NO: "いいえ",
-  QUESTION: "お問い合わせ"
-};
-
-// テキストレスポンス
-const TEXT_REPLY = {
-  ORDER_CONFIRM: "注文を開始してよろしいですか？",
-  CANCEL: "承知しました。\n何かございましたら、お気軽にお問い合わせください。",
-  ANSWER: "通常のLINEメッセージ機能からお問い合わせ可能です。"
-};
-
-
-
-/** LINEからのリクエスト処理 (Webhook) */
+/** 入口: 即時 200 応答（重い処理は置かない） */
 function doPost(e) {
   try {
-    // 受信データをパース
     const raw = (e && e.postData && e.postData.contents) ? e.postData.contents : "{}";
     const body = JSON.parse(raw);
     const events = Array.isArray(body.events) ? body.events : [];
 
     // イベントが無い場合も LINE に200を返す
     if (events.length === 0) {
-      return ContentService.createTextOutput("OK").setMimeType(ContentService.MimeType.TEXT);
+      return createOkResponse();
     }
 
-    // 複数イベントを順に処理
-    events.forEach(event => {
+    events.forEach(ev => {
       try {
-        const eventType = event.type;
-        const replyToken = event.replyToken;
-        const lineUserId = event.source && event.source.userId;
-
-        switch (eventType) {
-          case EVENT_TYPES.MESSAGE:
-            handleMessageEvent(event, lineUserId, replyToken);
-            break;
-          case EVENT_TYPES.FOLLOW:
-            handleFollowEvent(lineUserId);
-            break;
-          default:
-            // 未対応のイベントは無視
-            console.log(`Unhandled event type: ${eventType}`);
-            break;
-        }
-      } catch (innerErr) {
-        // 個別イベントの処理失敗は全体に影響させない
-        console.error(`Event handling error: ${innerErr.message}`);
+        dispatchLineEvent(ev);
+      } catch (err) {
+        console.error('dispatchLineEvent error:', err && err.stack || err);
       }
     });
-
-    // 常に200を返す（LINEは本文は見ない）
-    return ContentService.createTextOutput("OK").setMimeType(ContentService.MimeType.TEXT);
-
-  } catch (error) {
-    console.error(`doPost error: ${error.message}`);
-    return ContentService.createTextOutput("OK").setMimeType(ContentService.MimeType.TEXT);
+    return createOkResponse();
+  } catch (err) {
+    console.error('doPost global error:', err && err.stack || err);
+    return createOkResponse(); // 失敗しても 200 を返す
   }
 }
 
 
+/** 200 OK のテキストレスポンスを生成する。 */
+function createOkResponse() {
+  return ContentService.createTextOutput('OK').setMimeType(ContentService.MimeType.TEXT);
+}
 
-/** 
- * 内部ヘルパー関数
- */
+/** LINEイベント種別ごとでハンドラにディスパッチ */
+function dispatchLineEvent(event) {
+  const t = event && event.type;
+  const uid = event && event.source && event.source.userId;
+  const replyToken = event && event.replyToken;
 
-/** メッセージイベントごとの処理 */
-const handleMessageEvent = (event, lineUserId, replyToken) => {
+  if (t === 'message') return handleMessageEvent(event, uid, replyToken);
+  if (t === 'follow')  return handleFollowEvent(uid);
+}
+
+
+/** messageイベントハンドラ */
+function handleMessageEvent(event, lineUserId, replyToken) {
   try {
-    const userMessage = (event.message && event.message.text) ? event.message.text.trim() : "";
+    const text = (event && event.message && event.message.text || '').trim();
+    if (!text) return;
 
-    // ユーザーからのメッセージが、配列内のワードのどれにも該当しないとき
-    if (![MESSAGES.ORDER, MESSAGES.NO, MESSAGES.QUESTION].includes(userMessage)) { 
-      return;
-    }
-
-    // 管理者登録ワード確認（存在するなら先に処理）
-     try {
+    // 1) 管理者登録キーワード一致を優先
+    try {
       const keyword = getAdminRegisterKeyword();
-      if (keyword && userMessage === keyword) {
+      if (keyword && text === keyword && lineUserId) {
         registerAdminAccount(lineUserId);
         if (replyToken) {
-          sendReplyMessage(replyToken, [{ type: "text", text: "管理者アカウントとして登録しました。" }]);
+          LineMessagingService.reply(replyToken, [
+            { type: 'text', text: AppConfig.line.reply.ADMIN_REGISTERED }]);
         }
         return;
       }
     } catch (e) {
-      console.warn(`Admin keyword check skipped: ${e.message}`);
+      console.warn(`admin keyword unavailable: ${e && e.message}`);
     }
 
-  if (userMessage === MESSAGES.ORDER) {
-      handleOrderEvent(lineUserId, replyToken);
-    } else if (userMessage === MESSAGES.NO && replyToken) {
-      sendReplyMessage(replyToken, [{ type: "text", text: TEXT_REPLY.CANCEL }]);
-    } else if (userMessage === MESSAGES.QUESTION && replyToken) {
-      sendReplyMessage(replyToken, [{ type: "text", text: TEXT_REPLY.ANSWER }]);
+    // 2) コマンド群
+    if (text === AppConfig.line.commands.ORDER) {
+      return handleOrderEvent(lineUserId, replyToken);
+    }
+    if (text === AppConfig.line.commands.NO && replyToken) {
+      return LineMessagingService.reply(replyToken, [
+        { type: 'text', text: AppConfig.line.reply.CANCEL }
+      ]);
+    }
+    if (text === AppConfig.line.commands.QUESTION && replyToken) {
+      return LineMessagingService.reply(replyToken, [
+        { type: 'text', text: AppConfig.line.reply.ANSWER }
+      ]);
     }
   } catch (error) {
-    throw new Error(`Error in handleMessageEvent: ${error.message}`);
-  } 
-};
+    console.error(`handleMessageEvent: ${error && error.message}`);
+  }
+}
 
 
-/** 注文開始処理 */
-const handleOrderEvent = (lineUserId, replyToken) => {
+/** 注文開始（事前入力フォームURLを返信） */
+function handleOrderEvent(lineUserId, replyToken) {
   try {
     if (!lineUserId || !replyToken) return;
 
-    const now = new Date();
-    const orderId = now.getTime().toString(16);  // UNIXタイムスタンプを16進数表記に変換
-    // debug(`1.注文ID生成: ${orderId}`);
-        
-    // 注文IDをキーにして、LINEユーザーIDをキャッシュデータに保存
-    cache = makeCache();  // キャッシュを初期化
-    cache.put(orderId, lineUserId, 3600); // 有効期間は１時間
-    // debug(`3.キャッシュ完了: ${cache.get(orderId)}`);
+    const orderId = Utilities.getUuid(); // 一意の注文ID
 
-    // キャッシュデータをcacheシートにもバックアップ
-    const lastRow = cacheSheet.getLastRow() + 1;  // キャッシュシートの最終行
-    cacheSheet.getRange(lastRow, 1, 1, 3).setValues([[now, orderId, lineUserId]]);  // 日時、注文ID、LINEユーザーIDを格納
+    let prefilledUrl = '';
 
-    // 注文IDをフォームの初期値にセットして、事前入力された公開用URLを作成する
-    const prefilledUrl = generatePrefilledFormUrl(orderId);
-    // debug(prefilledUrl);
+    // 1) 事前入力URLを生成（内部で「entry.xxxが無い」「注文IDがURLに無い」等ならthrow）
+    try {
+      prefilledUrl = generatePrefilledFormUrl(orderId);
+    } catch (err) {
+      // 生成失敗：配布せず、管理者とユーザーに知らせて終了
+      notifyToAdmin(`⚠️ 注文フォームのURL生成に失敗: ${err && err.message}\norderId=${orderId}`);
+      LineMessagingService.reply(replyToken, [{
+        type: 'text',
+        text: 'ただいま注文フォームの準備でエラーが発生しました。お手数ですが、1分ほどおいてからもう一度「注文」と送ってください。'
+      }]);
+      return;
+    }
 
-    const replyMessage =  [
-      {
-        type: "template",
-        altText: "注文受付",
-        template: {
-          type: "confirm",
-          text: TEXT_REPLY.ORDER_CONFIRM,
-          actions: [
-            { type: "uri", label: "はい", uri: prefilledUrl },
-            { type: "message", label: "いいえ", text: MESSAGES.NO }
-          ]
-        }
+    // 2) フォームURLをユーザーへ提示（confirm テンプレ）
+    LineMessagingService.reply(replyToken, [{
+      type: 'template',
+      altText: '注文受付',
+      template: {
+        type: 'confirm',
+        text: AppConfig.line.reply.ORDER_CONFIRM,
+        actions: [
+          { type: 'uri', label: 'はい', uri: prefilledUrl },
+          { type: 'message', label: AppConfig.line.commands.NO, text: AppConfig.line.commands.NO }
+        ]
       }
-    ];
-    sendReplyMessage(replyToken, replyMessage);
+    }]);
+
+    // 3) URLの配布に成功した場合のみ、orderId ↔ userId を保存（返信紐付け用）
+    try {
+      const cache = makeCache();
+      cache.put(orderId, lineUserId, 3600);
+      const last = cacheSheet.getLastRow() + 1;
+      cacheSheet.getRange(last, 1, 1, 3).setValues([[new Date(), orderId, lineUserId]]);
+    } catch (persistErr) {
+      console.warn(`注文キャッシュの永続化（保存）に失敗しました: ${persistErr && persistErr.message}`);
+    }
   } catch (error) {
-    throw new Error(`Error in handleOrderEvent: ${error.message}`);
-  } 
-};
+    console.error(`handleOrderEvent: ${error && error.message}`);
+  }
+}
 
 
-/** フォローイベント処理 */
+/** followイベントハンドラ（LINE顧客IDシートへ登録） */
 const handleFollowEvent = (lineUserId) => {
   try {
     if (!lineUserId) return;
@@ -162,7 +145,6 @@ const handleFollowEvent = (lineUserId) => {
     customerSheet.appendRow([lineUserId, displayName]);
     customerSheet.getDataRange().removeDuplicates([1]);  // 列（1列目:ID)を指定して重複判定
 
-    // debug(`友だち追加イベント処理完了 : ${displayName}`);
   } catch (error) {
     throw new Error(`Error in handleFollowEvent: ${error.message}`);
   }
