@@ -11,6 +11,7 @@
  **************************************************************/
 
 
+
 /* ============================================================
  * 外部リソース参照：runtime handles (副作用あり)
  *    - Script Properties からID/トークンを取得
@@ -18,15 +19,25 @@
  *    - ここで実行時リソースを“1回だけ”開くことで、重複アクセスを抑制
  * ========================================================== */
 
-// ScriptProperties はここで1度だけ取得
+// Properties helper
 const ScriptProps = PropertiesService.getScriptProperties();
+const requiredProp = (k) => {
+  const v = ScriptProps.getProperty(k);
+  if (!v) throw new Error(`Missing Script Property: ${k}`);
+  return v;
+};
 
 // プロジェクト設定
-const FORM_ID = ScriptProps.getProperty('FORM_ID');
-const SPREADSHEET_ID = ScriptProps.getProperty('SPREADSHEET_ID');
-const LINE_CHANNEL_TOKEN = ScriptProps.getProperty('LINE_CHANNEL_TOKEN');
+const FORM_ID         = requiredProp('FORM_ID');
+const SPREADSHEET_ID  = requiredProp('SPREADSHEET_ID');
+const LINE_CHANNEL_TOKEN = requiredProp('LINE_CHANNEL_TOKEN');
+const FREEE_CLIENT_ID    = requiredProp('FREEE_CLIENT_ID');    // OAuthクライアントID
+const FREEE_CLIENT_SECRET= requiredProp('FREEE_CLIENT_SECRET');
 
-//　外部サービスのハンドル
+// 環境（prod/dev）モード別の可変設定
+const ENV = ScriptProps.getProperty('ENV') || 'prod';
+
+// 外部サービスのハンドル
 const form = FormApp.openById(FORM_ID);
 const ss   = SpreadsheetApp.openById(SPREADSHEET_ID);
 
@@ -55,7 +66,8 @@ const AppConfig = {
       DELIVERY_DATE: 'お届け日',
       COMMENT: 'コメント',
     },
-    menuStartIndex: 3, // フォームの設問におけるメニュー項目の開始インデックス
+    menuStartIndex: 3, // メニュー設問項目の開始インデックス
+    pageHistorySegments: ['0','1'], // セクション到達保証用
   },
 
   sheetNames: {
@@ -70,7 +82,7 @@ const AppConfig = {
   },
 
   menuSheet: {
-    contStartRow: 3,
+    startRow: 3,
     ckBoxCol: 1,
     itemIdCol: 2,
     itemNameCol: 3,
@@ -93,7 +105,7 @@ const AppConfig = {
     deliDateCol: 5,
     commentCol: 6,
     menuStartCol: 7,
-    contStartRow: 6,
+    startRow: 6,
   },
 
   freeeSheet: {
@@ -105,14 +117,14 @@ const AppConfig = {
     partnerNameCol: 6,
     partnerIdCol: 7,
     menuCol: 8,
-    contStartRow: 2,
+    startRow: 2,
   },
 
   partnersSheet: {
     nameCol: 1,
     idCol: 2,
     displayCol: 3,
-    contStartRow: 3,
+    startRow: 3,
     ourCompanyNameCell: 'E3',
     ourCompanyIdCell: 'F3',
     ourCompanyListRow: 10,
@@ -120,9 +132,18 @@ const AppConfig = {
   },
 
   adminSheet: {
-    registeredAtCol: 1, // A列: 登録時刻
-    uidCol: 2,          // B列: LINE UID
-    keywordCell: 'F2',  // 管理者登録キーワードのセル
+    uidCol: 1,  // LINE UID
+    keywordCell: 'E2',  // 管理者登録キーワードのセル
+    startRow: 2,
+  },
+
+  customerSheet: {
+    uidCol: 1,      // LINE UID
+    lineNameCol: 2,
+    shopName: 3,
+    freeeName: 4,
+    freeeId: 5,
+    startRow: 2,
   },
 
   line: {
@@ -154,6 +175,25 @@ const AppConfig = {
 
   freee: {
     baseUrl: 'https://api.freee.co.jp',
+
+    endpoints: {
+      usersMe:      '/api/1/users/me',
+      partners:     '/api/1/partners',
+      deliverySlips:'/iv/delivery_slips', // 納品書API
+    },
+
+    // // 既定パラメータや制限（変更されやすいものはここに集約）
+    // defaults: {
+    //   partners: { limit: 500, order: 'asc' }, // 必要に応じて
+    //   pagination: { limitMax: 500 },
+    // },
+
+    // // リトライ/レート制限方針を明示
+    // backoff: {
+    //   maxAttempts: 5,
+    //   baseDelayMs: 250,    // 0.25s, 0.5s, 1s...
+    //   retryStatuses: [401, 403, 429, 500, 502, 503, 504],
+    // },
   },
 };
 

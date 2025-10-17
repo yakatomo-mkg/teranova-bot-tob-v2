@@ -97,44 +97,88 @@ function notifyToAdmin(message) {
   LineMessagingService.notifyAdministrators(message);
 }
 
-/** 管理者登録キーワード（管理者シート!E2） */
+/** 管理者登録用キーワードを取得 */
 function getAdminRegisterKeyword() {
   const cell = AppConfig.adminSheet.keywordCell;
   const keyword = String(adminSheet.getRange(cell).getValue() || '').trim();
-  if (!keyword) throw new Error(`管理者登録キーワードが未設定です（${AppConfig.sheetNames.ADMIN}!${cell}）`);
-  return keyword;
+  return keyword || null;
 }
 
-/** UID を管理者シートに upsert（A:時刻, B:UID） */
-function registerAdminAccount(userId) {
-  const startRow = 2;
-  const lastRow = adminSheet.getLastRow();
-  if (lastRow >= startRow) {
-    const ids = adminSheet.getRange(startRow, 2, lastRow - startRow + 1, 1)
-      .getValues().flat().map(v => String(v || '').trim());
-    const idx = ids.findIndex(v => v === userId);
-    if (idx !== -1) {
-      adminSheet.getRange(startRow + idx, 1).setValue(new Date());
-      return;
-    }
-  }
-  adminSheet.getRange(lastRow + 1, 1, 1, 2).setValues([[new Date(), userId]]);
-}
-
-
-/** LINEプロフィール（ID & displayName）取得 */
-function getUserProfile(userId) {
+/** 管理者アカウントを登録 */
+function registerAdminAccount(lineUserId) {
   try {
-    const url = AppConfig.line.endpoints.profile(userId);
+    if (!lineUserId) {
+      return { ok: false, reason: 'NO_USER_ID' };
+    }
+
+    const { uidCol, startRow } = AppConfig.adminSheet;
+
+    // adminSheetで 同一 UID の有無をチェック （存在すれば終了）
+    const lastAdminRow = getLastDataRow(adminSheet, uidCol);
+    if (lastAdminRow >= startRow) {
+      const rowCount = lastAdminRow - startRow + 1;
+      const adminUids = adminSheet
+        .getRange(startRow, uidCol, rowCount, 1)
+        .getValues()
+        .flat()
+        .map(v => String(v || '').trim());
+      
+      // 既に登録済みなら何もしない
+      if (adminUids.includes(String(lineUserId))) {
+        return { ok: true, already: true };  // 既に登録済み
+      }
+    }
+    
+    // displayName を取得（まずcustomerSheetをチェック -> 無ければ API ）
+    let displayName = '';
+    try {
+      const customerIndex = buildCustomerIndexByUid(5);
+      const rec = customerIndex[lineUserId];
+      if (rec) {
+        const lineNameColIdx = AppConfig.customerSheet.lineNameCol - 1;
+        displayName = String(rec.values[lineNameColIdx] || '').trim();
+      }
+    } catch (e) {
+      console.warn(`registerAdminAccount: buildCustomerIndexByUid failed: ${e && e.message}`);
+    }
+    if (!displayName) {
+      try {
+        // フォールバック: LINE API から取得
+        displayName = String(getUserProfile(lineUserId) || '').trim();
+      } catch (e) {
+        console.warn(`registerAdminAccount: getUserProfile failed: ${e && e.message}`);
+      }
+    }
+
+    // 一括書き込み（UID, displayName）
+    const insertRow = (lastAdminRow >= startRow ? lastAdminRow : (startRow - 1)) + 1;
+    adminSheet.getRange(insertRow, uidCol, 1, 2).setValues([[ lineUserId, displayName ]]);
+
+    return { ok: true, created: true };  // 新規登録成功
+
+  } catch (error) {
+    logErrorToSheet('管理者登録に失敗', error);
+    console.error(`registerAdminAccount: ${error && error.message}`);
+    return { ok: false, reason: 'EXCEPTION' };
+  }
+  
+}
+
+
+/** LINE UID から 表示名 を取得 */
+function getUserProfile(lineUserId) {
+  try {
+    const url = AppConfig.line.endpoints.profile(lineUserId);
     const res = UrlFetchApp.fetch(url, {
       method: 'get',
       headers: { Authorization: `Bearer ${LINE_CHANNEL_TOKEN}` },
       muteHttpExceptions: true
     });
     const code = res.getResponseCode();
-    if (code >= 400) throw new Error(`LINE profile error ${code}: ${res.getContentText()}`);
-    const json = JSON.parse(res.getContentText() || '{}');
-    return json.displayName || '';
+    const body = res.getContentText() || '';
+    if (code >= 400) throw new Error(`LINE profile error ${code}: ${body}`);
+    const json = JSON.parse(body || '{}');
+    return String(json.displayName || '').trim();
   } catch (error) {
     throw new Error(`Error in getUserProfile: ${error.message}`);
   }
@@ -180,6 +224,48 @@ function generatePrefilledFormUrl(orderId) {
   } catch (error) {
     throw new Error(`Error in generatePrefilledFormUrl: ${error.message}`);
   }
+}
+
+
+/** 顧客シートを走査して UID -> 行データのインデックス を作る。 */
+/** 生成されるデータ形式例: 
+ * customerIndexByUid = {
+    "U12345": {
+      row: 7,
+      values: [ "U12345", "LINEユーザー名", "飲食店名", "freeeユーザー名", "freeeID" ]
+    },
+    "U67890": {...}
+  };
+ */
+function buildCustomerIndexByUid(columnCount = 5) {
+  if (!Number.isInteger(columnCount) || columnCount <= 0) {
+    throw new Error('buildCustomerIndexByUid: columnCount must be a positive integer.');
+  }
+
+  const { uidCol, startRow } = AppConfig.customerSheet;
+
+  // 最終行を UID 列基準で取得
+  const lastDataRow = getLastDataRow(customerSheet, uidCol);
+  if (lastDataRow < startRow) return {};
+
+  // 登録済の顧客データを一括取得
+  const totalRows = lastDataRow - startRow + 1;  // 読み込む行数
+  const totalCols = Math.max(columnCount, uidCol);  // 読み込む列数
+  const customerData = customerSheet.getRange(startRow, 1, totalRows, totalCols).getValues();
+
+
+  const customerIndexByUid = {};
+  for (let i = 0; i < customerData.length; i++) {
+    const rowCells = customerData[i]; // 1行データ
+    const userId = String(rowCells[uidCol - 1] || '').trim();
+    if (!userId) continue; // UID未入力行はスキップ
+
+    customerIndexByUid[userId] = {
+      row: startRow + i,  // 行番号に変換
+      values: rowCells.slice(0, columnCount),  // 行データをキャッシュ
+    };
+  }
+  return customerIndexByUid;
 }
 
 
